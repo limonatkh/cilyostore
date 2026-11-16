@@ -1,0 +1,20 @@
+rules_version = '2';
+
+// قواعد حماية التخزين.
+// المستخدم بيرفع ملف zip لمجلده بس. السيرفر بيفحصه وبيفكّه لمجلد games،
+// وملفات games ما بتنقرأ إلا عن طريق موقع الألعاب.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /uploads/{uid}/{fileName} {
+      allow create, update: if request.auth != null
+        && request.auth.uid == uid
+        && request.resource.size <= 100 * 1024 * 1024
+        && fileName.matches('^[A-Za-z0-9_-]{6,40}[.]zip$');
+      allow read, delete: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
