@@ -1,0 +1,206 @@
+rules_version = '2';
+
+// قواعد حماية قاعدة البيانات.
+// المبدأ: الواجهة بتقرأ اللي مسموح إلها، وبتكتب بس رسائل المحادثة والبلاغات.
+// كل إشي ثاني (الحسابات، الاستوديوهات، العقود، المشاريع، الحصص، الموافقات، السجل، الأعمال)
+// بتكتبه دوال السيرفر بس، فما حدا بيقدر يعدّله من المتصفح.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function studioData(studioId) {
+      return get(/databases/$(database)/documents/studios/$(studioId)).data;
+    }
+
+    function projectData(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)).data;
+    }
+
+    function workData(workId) {
+      return get(/databases/$(database)/documents/works/$(workId)).data;
+    }
+
+    function isStudioMember(studioId) {
+      return signedIn() && request.auth.uid in studioData(studioId).members;
+    }
+
+    function isParticipant(projectId) {
+      return signedIn() && request.auth.uid in projectData(projectId).participants;
+    }
+
+    function inTeam(work) {
+      return signedIn() && request.auth.uid in work.teamUids;
+    }
+
+    function canSeeWork(work) {
+      return work.status == 'published' || inTeam(work) || isAdmin();
+    }
+
+    function myUsername() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.username;
+    }
+
+    // رسالة محادثة سليمة: من صاحبها، باسمه الحقيقي، وبوقت السيرفر
+    function validMessage() {
+      return request.resource.data.keys().hasAll(['uid', 'author', 'text', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'author', 'text', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.author == myUsername()
+        && request.resource.data.text is string
+        && request.resource.data.text.size() > 0
+        && request.resource.data.text.size() <= 2000
+        && request.resource.data.createdAt == request.time;
+    }
+
+    // ---------- الحسابات ----------
+    match /users/{uid} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    match /usernames/{name} {
+      allow read, write: if false;
+    }
+
+    match /connectorTokens/{tokenHash} {
+      allow read, write: if false;
+    }
+
+    // مشرفو المنصة: بينضافوا يدويًا من لوحة Firebase
+    match /admins/{uid} {
+      allow get: if signedIn() && request.auth.uid == uid;
+      allow list, write: if false;
+    }
+
+    // ---------- الاستوديوهات ----------
+    match /studios/{studioId} {
+      allow read: if true;
+      allow write: if false;
+
+      // العقد: للأعضاء والمعزومين (عشان يشوفوه قبل ما يقبلوا)
+      match /internal/{docId} {
+        allow read: if signedIn()
+          && (request.auth.uid in studioData(studioId).members || request.auth.uid in studioData(studioId).invites);
+        allow write: if false;
+      }
+
+      match /log/{entryId} {
+        allow read: if isStudioMember(studioId);
+        allow write: if false;
+      }
+
+      match /channels/{channelId}/messages/{messageId} {
+        allow read: if isStudioMember(studioId);
+        allow create: if isStudioMember(studioId) && channelId == 'general' && validMessage();
+        allow delete: if isStudioMember(studioId) && resource.data.uid == request.auth.uid;
+        allow update: if false;
+      }
+    }
+
+    // ---------- المشاريع ----------
+    match /projects/{projectId} {
+      allow read: if signedIn()
+        && (request.auth.uid in resource.data.participants || request.auth.uid in resource.data.invites);
+      allow write: if false;
+
+      // الأدوار: للمشاركين والمعزومين (عشان يشوفوا الميثاق قبل ما يقبلوا)
+      match /roles/{roleId} {
+        allow read: if signedIn()
+          && (request.auth.uid in projectData(projectId).participants || request.auth.uid in projectData(projectId).invites);
+        allow write: if false;
+      }
+
+      match /earnings/{entryId} {
+        allow read: if isParticipant(projectId);
+        allow write: if false;
+      }
+
+      match /agreements/{agreementId} {
+        allow read: if isParticipant(projectId);
+        allow write: if false;
+      }
+
+      match /approvals/{approvalId} {
+        allow read: if isParticipant(projectId);
+        allow write: if false;
+      }
+
+      match /trials/{trialId} {
+        allow read: if isParticipant(projectId);
+        allow write: if false;
+      }
+
+      match /log/{entryId} {
+        allow read: if isParticipant(projectId);
+        allow write: if false;
+      }
+
+      match /channels/{channelId}/messages/{messageId} {
+        allow read: if isParticipant(projectId);
+        allow create: if isParticipant(projectId) && channelId == 'general' && validMessage();
+        allow delete: if isParticipant(projectId) && resource.data.uid == request.auth.uid;
+        allow update: if false;
+      }
+    }
+
+    // ---------- الأعمال المنشورة وسيرفراتها ----------
+    match /works/{workId} {
+      allow read: if canSeeWork(resource.data);
+      allow write: if false;
+
+      match /channels/{channelId}/messages/{messageId} {
+        allow read: if canSeeWork(workData(workId));
+
+        // القنوات العامة لأي مستخدم، وقنوات الفريق (أخبار، يوميات) لفريق العمل بس
+        allow create: if signedIn()
+          && channelId in ['general', 'bugs', 'news', 'devlog']
+          && validMessage()
+          && (inTeam(workData(workId))
+            || (workData(workId).status == 'published' && channelId in ['general', 'bugs']));
+
+        allow delete: if signedIn()
+          && (resource.data.uid == request.auth.uid || inTeam(workData(workId)) || isAdmin());
+
+        allow update: if false;
+      }
+    }
+
+    // ---------- لوحة الفرص ----------
+    match /openRoles/{roleId} {
+      allow read: if true;
+      allow write: if false;
+
+      // الطلبات: لصاحب الطلب ولأعضاء الاستوديو صاحب الدور
+      match /applications/{applicantUid} {
+        allow read: if signedIn()
+          && (request.auth.uid == applicantUid
+            || isStudioMember(get(/databases/$(database)/documents/openRoles/$(roleId)).data.studioId));
+        allow write: if false;
+      }
+    }
+
+    // ---------- البلاغات ----------
+    match /reports/{reportId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasAll(['uid', 'workId', 'reason', 'createdAt'])
+        && request.resource.data.keys().hasOnly(['uid', 'workId', 'reason', 'createdAt'])
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.workId is string
+        && request.resource.data.workId.size() <= 40
+        && request.resource.data.reason is string
+        && request.resource.data.reason.size() > 0
+        && request.resource.data.reason.size() <= 500
+        && request.resource.data.createdAt == request.time;
+
+      allow read, delete: if isAdmin();
+      allow update: if false;
+    }
+  }
+}
